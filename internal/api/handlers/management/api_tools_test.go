@@ -2,9 +2,13 @@ package management
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -208,5 +212,81 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 	if gotCompat.ID != compatAuth.ID {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestAPICallRecordsAntigravityCreditsFromLoadCodeAssist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(strings.ToLower(r.URL.Path), "loadcodeassist") {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"paidTier": {
+				"id": "g1-pro-tier",
+				"availableCredits": [
+					{
+						"creditType": "GOOGLE_ONE_AI",
+						"creditAmount": "24092",
+						"minimumCreditAmountForUsage": "50"
+					}
+				]
+			}
+		}`))
+	}))
+	defer upstream.Close()
+
+	const authID = "antigravity-api-call-credits"
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	body := fmt.Sprintf(`{
+		"auth_index": %q,
+		"method": "POST",
+		"url": %q,
+		"header": {"Content-Type": "application/json"},
+		"data": "{}"
+	}`, auth.EnsureIndex(), upstream.URL+"/v1internal:loadCodeAssist")
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("APICall status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	hint, ok := coreauth.GetAntigravityCreditsHint(authID)
+	if !ok {
+		t.Fatal("expected Antigravity credits hint cache entry")
+	}
+	if !hint.Known {
+		t.Fatal("expected Antigravity credits hint to be recorded")
+	}
+	if !hint.Available {
+		t.Fatal("expected Antigravity credits to be available")
+	}
+	if hint.CreditAmount != 24092 {
+		t.Fatalf("credit amount = %v, want 24092", hint.CreditAmount)
+	}
+	if hint.MinCreditAmount != 50 {
+		t.Fatalf("minimum credit amount = %v, want 50", hint.MinCreditAmount)
+	}
+	if hint.PaidTierID != "g1-pro-tier" {
+		t.Fatalf("paid tier = %q, want %q", hint.PaidTierID, "g1-pro-tier")
 	}
 }

@@ -24,6 +24,7 @@ static/*
 # Authentication data
 auths/*
 !auths/.gitkeep
+/*.json
 
 # Documentation
 docs/*
@@ -35,6 +36,7 @@ GEMINI.md
 .vscode/*
 .worktrees/
 .codex/*
+.ai_memory/
 .claude/*
 .gemini/*
 .serena/*

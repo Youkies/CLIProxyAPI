@@ -21,6 +21,12 @@ func resetAntigravityCreditsRetryState() {
 	antigravityShortCooldownByAuth = sync.Map{}
 	antigravityCreditsBalanceByAuth = sync.Map{}
 	antigravityCreditsHintRefreshByID = sync.Map{}
+	agQuotaCacheMu.Lock()
+	agQuotaCache = make(map[agQuotaKey]*agAuthQuotaState)
+	agQuotaCacheMu.Unlock()
+	agNoCreditCacheMu.Lock()
+	agNoCreditCache = make(map[string]time.Time)
+	agNoCreditCacheMu.Unlock()
 }
 
 func TestClassifyAntigravity429(t *testing.T) {
@@ -105,6 +111,74 @@ func TestClassifyAntigravity429(t *testing.T) {
 	})
 }
 
+func TestClassify429ForQuotaRouting(t *testing.T) {
+	t.Run("short rate limit switches credential", func(t *testing.T) {
+		body := []byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.5s"}]}}`)
+		action, delay := classify429(http.StatusTooManyRequests, body)
+		if action != ag429RateLimit {
+			t.Fatalf("action = %v, want rate limit", action)
+		}
+		if delay == nil || *delay != 500*time.Millisecond {
+			t.Fatalf("delay = %v, want 500ms", delay)
+		}
+	})
+
+	t.Run("long rate limit is quota gone", func(t *testing.T) {
+		body := []byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2h"}]}}`)
+		action, _ := classify429(http.StatusTooManyRequests, body)
+		if action != ag429QuotaGone {
+			t.Fatalf("action = %v, want quota gone", action)
+		}
+	})
+
+	t.Run("bare grpc resource exhausted is ambiguous", func(t *testing.T) {
+		body := []byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`)
+		action, _ := classify429(http.StatusTooManyRequests, body)
+		if action != ag429AmbiguousTransient {
+			t.Fatalf("action = %v, want ambiguous transient", action)
+		}
+	})
+}
+
+func TestDecideAgQuotaRoute_FreeFirstThenCredit(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	agRecordFreeQuotaGone("auth-route", cliproxyexecutor.FamilyQuotaClaude, nil)
+
+	phase1 := decideAgQuotaRoute(cliproxyexecutor.WithFreeQuotaOnly(context.Background()), "auth-route", cliproxyexecutor.FamilyQuotaClaude, true)
+	if phase1.action != agQuotaRouteDeferFree || !cliproxyexecutor.IsFreeQuotaDeferralErr(phase1.err) {
+		t.Fatalf("phase1 decision = %#v, want free deferral", phase1)
+	}
+
+	phase2 := decideAgQuotaRoute(context.Background(), "auth-route", cliproxyexecutor.FamilyQuotaClaude, true)
+	if phase2.action != agQuotaRouteUseCredit || phase2.err != nil {
+		t.Fatalf("phase2 decision = %#v, want use credit", phase2)
+	}
+}
+
+func TestDecideAgQuotaRoute_UsesContextFreeQuotaHint(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	hint := cliproxyexecutor.FreeQuotaCooldownHintMap{
+		cliproxyexecutor.FamilyQuotaClaude: {
+			"auth-hinted": time.Now().Add(time.Hour),
+		},
+	}
+	baseCtx := cliproxyexecutor.WithFreeQuotaCooldownHint(context.Background(), hint)
+
+	phase1 := decideAgQuotaRoute(cliproxyexecutor.WithFreeQuotaOnly(baseCtx), "auth-hinted", cliproxyexecutor.FamilyQuotaClaude, true)
+	if phase1.action != agQuotaRouteDeferFree || !cliproxyexecutor.IsFreeQuotaDeferralErr(phase1.err) {
+		t.Fatalf("phase1 decision = %#v, want free deferral from context hint", phase1)
+	}
+
+	phase2 := decideAgQuotaRoute(baseCtx, "auth-hinted", cliproxyexecutor.FamilyQuotaClaude, true)
+	if phase2.action != agQuotaRouteUseCredit || phase2.err != nil {
+		t.Fatalf("phase2 decision = %#v, want use credit from context hint", phase2)
+	}
+}
+
 func TestAntigravityShouldRetryNoCapacity_Standard503(t *testing.T) {
 	body := []byte(`{
 		"error": {
@@ -158,23 +232,15 @@ func TestParseRetryDelay_HumanReadableDuration(t *testing.T) {
 	}
 }
 
-func TestAntigravityExecute_RetriesTransient429ResourceExhausted(t *testing.T) {
+func TestAntigravityExecute_DefersAmbiguous429ToConductor(t *testing.T) {
 	resetAntigravityCreditsRetryState()
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
-		switch requestCount {
-		case 1:
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`))
-		case 2:
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`))
-		default:
-			t.Fatalf("unexpected request count %d", requestCount)
-		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`))
 	}))
 	defer server.Close()
 
@@ -191,20 +257,20 @@ func TestAntigravityExecute_RetriesTransient429ResourceExhausted(t *testing.T) {
 		},
 	}
 
-	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-4-6",
 		Payload: []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatAntigravity,
 	})
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	if !cliproxyexecutor.IsFreeQuotaDeferralErr(err) {
+		t.Fatalf("Execute() error = %T %v, want free quota deferral", err, err)
 	}
-	if len(resp.Payload) == 0 {
-		t.Fatal("Execute() returned empty payload")
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
 	}
-	if requestCount != 2 {
-		t.Fatalf("request count = %d, want 2", requestCount)
+	if !agFreeQuotaInCooldown("auth-transient-429", cliproxyexecutor.FamilyQuotaClaude) {
+		t.Fatal("free quota cooldown was not recorded")
 	}
 }
 
@@ -473,6 +539,69 @@ func TestUpdateAntigravityCreditsBalance_LoadCodeAssistUserAgent(t *testing.T) {
 	}))
 
 	exec.updateAntigravityCreditsBalance(ctx, auth, "token")
+}
+
+func TestUpdateAntigravityCreditsBalance_CurrentTierSnakeCaseCredits(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	exec := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-current-tier-snake-credits",
+	}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
+			t.Fatalf("unexpected request url %s", req.URL.String())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"current_tier":{"id":"g1-pro-tier","available_credits":[{"credit_type":"GOOGLE_ONE_AI","credit_amount":123}]}}`)),
+		}, nil
+	}))
+
+	exec.updateAntigravityCreditsBalance(ctx, auth, "token")
+
+	hint, ok := cliproxyauth.GetAntigravityCreditsHint(auth.ID)
+	if !ok || !hint.Known {
+		t.Fatal("expected known credits hint")
+	}
+	if !hint.Available {
+		t.Fatalf("hint.Available = %v, want true", hint.Available)
+	}
+	if hint.CreditAmount != 123 || hint.MinCreditAmount != 1 || hint.PaidTierID != "g1-pro-tier" {
+		t.Fatalf("hint = %+v, want amount 123, min 1, tier g1-pro-tier", hint)
+	}
+}
+
+func TestUpdateAntigravityCreditsBalance_NoGoogleOneCreditsMarksUnavailable(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	exec := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-no-google-one-credits",
+	}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"paidTier":{"id":"free-tier","availableCredits":[{"creditType":"OTHER","creditAmount":"10"}]}}`)),
+		}, nil
+	}))
+
+	exec.updateAntigravityCreditsBalance(ctx, auth, "token")
+
+	hint, ok := cliproxyauth.GetAntigravityCreditsHint(auth.ID)
+	if !ok || !hint.Known {
+		t.Fatal("expected known credits hint")
+	}
+	if hint.Available {
+		t.Fatalf("hint.Available = %v, want false", hint.Available)
+	}
+	if hint.PaidTierID != "free-tier" {
+		t.Fatalf("hint.PaidTierID = %q, want free-tier", hint.PaidTierID)
+	}
 }
 
 func TestParseMetaFloat(t *testing.T) {

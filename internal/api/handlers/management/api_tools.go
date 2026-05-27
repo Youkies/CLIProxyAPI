@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -208,6 +210,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	maybeRecordAntigravityCreditsFromAPICall(auth, urlStr, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -611,6 +614,126 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+func maybeRecordAntigravityCreditsFromAPICall(auth *coreauth.Auth, urlStr string, body []byte) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" || len(body) == 0 {
+		return
+	}
+	parsedURL, errParse := url.Parse(strings.TrimSpace(urlStr))
+	if errParse != nil {
+		return
+	}
+	if !strings.Contains(strings.ToLower(parsedURL.Path), "loadcodeassist") {
+		return
+	}
+	hint, ok := antigravityCreditsHintFromLoadCodeAssist(body)
+	if !ok {
+		return
+	}
+	coreauth.SetAntigravityCreditsHint(authID, hint)
+}
+
+func antigravityCreditsHintFromLoadCodeAssist(body []byte) (coreauth.AntigravityCreditsHint, bool) {
+	payload := gjson.ParseBytes(body)
+	if !payload.Exists() {
+		return coreauth.AntigravityCreditsHint{}, false
+	}
+	paidTierID := firstGJSONPathString(payload,
+		"paidTier.id",
+		"paid_tier.id",
+		"currentTier.id",
+		"current_tier.id",
+	)
+	credits, hasCredits := firstGJSONPathArray(payload,
+		"paidTier.availableCredits",
+		"paidTier.available_credits",
+		"paid_tier.availableCredits",
+		"paid_tier.available_credits",
+		"currentTier.availableCredits",
+		"currentTier.available_credits",
+		"current_tier.availableCredits",
+		"current_tier.available_credits",
+	)
+	if !hasCredits {
+		return coreauth.AntigravityCreditsHint{
+			Known:      true,
+			Available:  false,
+			PaidTierID: paidTierID,
+			UpdatedAt:  time.Now(),
+		}, true
+	}
+	for _, credit := range credits.Array() {
+		creditType := firstGJSONPathString(credit, "creditType", "credit_type", "type")
+		if !strings.EqualFold(creditType, "GOOGLE_ONE_AI") {
+			continue
+		}
+		creditAmount, okCreditAmount := firstGJSONPathFloat(credit, "creditAmount", "credit_amount", "amount", "availableAmount", "available_amount")
+		if !okCreditAmount {
+			continue
+		}
+		minAmount, okMinAmount := firstGJSONPathFloat(credit, "minimumCreditAmountForUsage", "minimum_credit_amount_for_usage", "minCreditAmount", "min_credit_amount")
+		if !okMinAmount {
+			minAmount = 1
+		}
+		return coreauth.AntigravityCreditsHint{
+			Known:           true,
+			Available:       creditAmount >= minAmount,
+			CreditAmount:    creditAmount,
+			MinCreditAmount: minAmount,
+			PaidTierID:      paidTierID,
+			UpdatedAt:       time.Now(),
+		}, true
+	}
+	return coreauth.AntigravityCreditsHint{
+		Known:      true,
+		Available:  false,
+		PaidTierID: paidTierID,
+		UpdatedAt:  time.Now(),
+	}, true
+}
+
+func firstGJSONPathString(source gjson.Result, paths ...string) string {
+	for _, path := range paths {
+		if value := source.Get(path); value.Exists() {
+			if text := strings.TrimSpace(value.String()); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func firstGJSONPathArray(source gjson.Result, paths ...string) (gjson.Result, bool) {
+	for _, path := range paths {
+		if value := source.Get(path); value.Exists() && value.IsArray() {
+			return value, true
+		}
+	}
+	return gjson.Result{}, false
+}
+
+func firstGJSONPathFloat(source gjson.Result, paths ...string) (float64, bool) {
+	for _, path := range paths {
+		value := source.Get(path)
+		if !value.Exists() {
+			continue
+		}
+		switch value.Type {
+		case gjson.Number:
+			return value.Float(), true
+		case gjson.String:
+			parsed, errParse := strconv.ParseFloat(strings.ReplaceAll(strings.TrimSpace(value.String()), ",", ""), 64)
+			if errParse == nil {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {

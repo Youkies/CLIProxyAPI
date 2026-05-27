@@ -66,6 +66,31 @@ type antigravityCreditsFailureState struct {
 	ExplicitBalanceExhausted bool
 }
 
+// freeQuotaDeferralErr tells the conductor to defer this auth to the credit phase.
+type freeQuotaDeferralErr struct {
+	authID        string
+	family        string
+	cooldownUntil time.Time
+	message       string
+}
+
+func (e freeQuotaDeferralErr) Error() string             { return "free_quota_deferred: " + e.authID }
+func (e freeQuotaDeferralErr) IsFreeQuotaDeferral() bool { return true }
+func (e freeQuotaDeferralErr) FreeQuotaAuthID() string   { return e.authID }
+func (e freeQuotaDeferralErr) FreeQuotaFamily() string   { return e.family }
+func (e freeQuotaDeferralErr) FreeQuotaCooldownUntil() time.Time {
+	return e.cooldownUntil
+}
+func (e freeQuotaDeferralErr) FreeQuotaMessage() string { return e.message }
+
+// rateLimitSwitchErr tells the conductor to switch credentials without marking
+// the current auth as a failed quota candidate.
+type rateLimitSwitchErr struct{ authID string }
+
+func (e rateLimitSwitchErr) Error() string           { return "rate_limit_switch: " + e.authID }
+func (e rateLimitSwitchErr) IsRateLimitSwitch() bool { return true }
+func (e rateLimitSwitchErr) StatusCode() int         { return http.StatusTooManyRequests }
+
 type antigravity429DecisionKind string
 
 const (
@@ -472,6 +497,192 @@ func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 	return err
 }
 
+func newCooldownStatusErr(msg string) statusErr {
+	d := 30 * time.Second
+	return statusErr{code: http.StatusTooManyRequests, msg: msg, retryAfter: &d}
+}
+
+type agQuotaRouteAction int
+
+const (
+	agQuotaRouteNormal agQuotaRouteAction = iota
+	agQuotaRouteUseCredit
+	agQuotaRouteDeferFree
+	agQuotaRouteProbe
+	agQuotaRouteBothCooldown
+	agQuotaRouteCreditDisabled
+	agQuotaRouteDeferQPM
+)
+
+type agQuotaRouteDecision struct {
+	action agQuotaRouteAction
+	err    error
+}
+
+func agFreeQuotaHintDeadline(ctx context.Context, authID, family string) (time.Time, bool) {
+	if authID == "" || family == "" {
+		return time.Time{}, false
+	}
+	hint := cliproxyexecutor.FreeQuotaCooldownHint(ctx)
+	if len(hint) == 0 {
+		return time.Time{}, false
+	}
+	ids := hint[family]
+	if len(ids) == 0 {
+		return time.Time{}, false
+	}
+	until, ok := ids[authID]
+	if !ok {
+		return time.Time{}, false
+	}
+	if until.IsZero() {
+		return time.Time{}, true
+	}
+	if until.After(time.Now()) {
+		return until, true
+	}
+	return time.Time{}, false
+}
+
+func decideAgQuotaRoute(ctx context.Context, authID, family string, creditAllowed bool) agQuotaRouteDecision {
+	if agQPMInCooldown(authID, family) {
+		return agQuotaRouteDecision{action: agQuotaRouteDeferQPM, err: rateLimitSwitchErr{authID: authID}}
+	}
+
+	freeCd := agFreeQuotaInCooldown(authID, family)
+	if until, ok := agFreeQuotaHintDeadline(ctx, authID, family); ok {
+		freeCd = true
+		if !until.IsZero() {
+			agRecordFreeQuotaCooldownUntil(authID, family, until)
+		}
+	}
+	creditCd := agCreditInCooldown(authID, family)
+	if !freeCd {
+		return agQuotaRouteDecision{action: agQuotaRouteNormal}
+	}
+	if creditCd {
+		if agShouldProbe(authID, family) {
+			return agQuotaRouteDecision{action: agQuotaRouteProbe}
+		}
+		return agQuotaRouteDecision{
+			action: agQuotaRouteBothCooldown,
+			err:    newCooldownStatusErr("antigravity: both free quota and credit in cooldown"),
+		}
+	}
+	if cliproxyexecutor.IsFreeQuotaOnly(ctx) {
+		return agQuotaRouteDecision{action: agQuotaRouteDeferFree, err: freeQuotaDeferralErr{authID: authID, family: family}}
+	}
+	if !creditAllowed {
+		return agQuotaRouteDecision{
+			action: agQuotaRouteCreditDisabled,
+			err:    newCooldownStatusErr("antigravity: credit disabled for family=" + family + ", free quota exhausted"),
+		}
+	}
+	return agQuotaRouteDecision{action: agQuotaRouteUseCredit}
+}
+
+func (e *AntigravityExecutor) prepareAntigravityQuotaRouting(ctx context.Context, auth *cliproxyauth.Auth, baseModel, path string, translated []byte) ([]byte, string, string, bool, bool, error) {
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	family, _ := antigravityModelFamily(baseModel)
+	creditAllowed := antigravityCreditsRetryEnabled(e.cfg)
+
+	applyCredit := func() ([]byte, bool, error) {
+		cp := injectEnabledCreditTypes(translated)
+		if len(cp) == 0 {
+			return translated, false, statusErr{code: http.StatusInternalServerError, msg: "antigravity: failed to inject credit types"}
+		}
+		helps.MarkCreditsUsed(ctx)
+		return cp, true, nil
+	}
+
+	if cliproxyauth.AntigravityCreditsRequested(ctx) {
+		if !creditAllowed {
+			return translated, authID, family, false, false, newCooldownStatusErr("antigravity: credits requested but credit fallback is disabled")
+		}
+		cp, usedCredit, errCredit := applyCredit()
+		if errCredit != nil {
+			return translated, authID, family, false, false, errCredit
+		}
+		return cp, authID, family, usedCredit, false, nil
+	}
+
+	isProbe := false
+	switch decision := decideAgQuotaRoute(ctx, authID, family, creditAllowed); decision.action {
+	case agQuotaRouteUseCredit:
+		log.Debugf("antigravity: free quota cooldown hit auth=%s family=%s action=use_credit path=%s", authID, family, path)
+		cp, usedCredit, errCredit := applyCredit()
+		if errCredit != nil {
+			return translated, authID, family, false, false, errCredit
+		}
+		return cp, authID, family, usedCredit, false, nil
+	case agQuotaRouteDeferFree:
+		log.Debugf("antigravity: free quota cooldown hit auth=%s family=%s action=defer_phase1 path=%s", authID, family, path)
+		return translated, authID, family, false, false, decision.err
+	case agQuotaRouteDeferQPM:
+		log.Debugf("antigravity: qpm cooldown skip auth=%s family=%s action=defer_to_conductor path=%s", authID, family, path)
+		return translated, authID, family, false, false, decision.err
+	case agQuotaRouteProbe:
+		log.Debugf("antigravity: both quota channels in cooldown auth=%s family=%s action=probe path=%s", authID, family, path)
+		isProbe = true
+	case agQuotaRouteBothCooldown, agQuotaRouteCreditDisabled:
+		return translated, authID, family, false, false, decision.err
+	}
+	return translated, authID, family, false, isProbe, nil
+}
+
+func handleAntigravityQuota429(authID, family string, statusCode int, body []byte, usedCredit bool, auth *cliproxyauth.Auth) error {
+	action, parsedDelay := classify429(statusCode, body)
+	switch action {
+	case ag429QuotaGone:
+		if !usedCredit {
+			cooldownUntil := agRecordFreeQuotaGone(authID, family, parsedDelay)
+			log.Debugf("antigravity: free quota exhausted auth=%s family=%s action=defer_to_conductor", authID, family)
+			return freeQuotaDeferralErr{authID: authID, family: family, cooldownUntil: cooldownUntil, message: string(body)}
+		}
+		agRecordCreditGone(authID, family, parsedDelay)
+		if isInsufficientG1Credits(statusCode, body) {
+			agRecordNoCreditBalance(authID)
+			markAntigravityCreditsPermanentlyDisabled(auth)
+			log.Debugf("antigravity: no G1 credit auth=%s family=%s parked=%s", authID, family, noCreditCooldownDuration)
+		}
+	case ag429AmbiguousTransient:
+		if !usedCredit {
+			cooldownUntil := agRecordAmbiguousFreeQuotaTransient(authID, family)
+			log.Debugf("antigravity: ambiguous resource exhausted auth=%s family=%s action=defer_to_conductor", authID, family)
+			return freeQuotaDeferralErr{authID: authID, family: family, cooldownUntil: cooldownUntil, message: string(body)}
+		}
+		agRecordAmbiguousCreditTransient(authID, family)
+	case ag429RateLimit:
+		retryAfter := time.Duration(0)
+		if parsedDelay != nil {
+			retryAfter = *parsedDelay
+		}
+		agRecordQPMRateLimit(authID, family, retryAfter)
+		log.Debugf("antigravity: qpm rate limit auth=%s family=%s action=switch_credential", authID, family)
+		return rateLimitSwitchErr{authID: authID}
+	}
+	return nil
+}
+
+func markAntigravityQuotaSuccess(authID, family string, usedCredit, isProbe bool) {
+	if authID == "" || family == "" {
+		return
+	}
+	if usedCredit {
+		agResetCredit(authID, family)
+		agClearNoCredit(authID)
+	} else {
+		agResetFreeQuota(authID, family)
+	}
+	if isProbe {
+		agResetCredit(authID, family)
+		agClearNoCredit(authID)
+	}
+}
+
 // Execute performs a non-streaming request to the Antigravity API.
 func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
@@ -524,7 +735,11 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 
-	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+	requestPayloadBase, authID, family, usedCredit, isProbe, errRoute := e.prepareAntigravityQuotaRouting(ctx, auth, baseModel, "nonstream", translated)
+	if errRoute != nil {
+		err = errRoute
+		return resp, err
+	}
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
@@ -537,13 +752,7 @@ attemptLoop:
 		var lastErr error
 
 		for idx, baseURL := range baseURLs {
-			requestPayload := translated
-			if useCredits {
-				if cp := injectEnabledCreditTypes(translated); len(cp) > 0 {
-					requestPayload = cp
-					helps.MarkCreditsUsed(ctx)
-				}
-			}
+			requestPayload := requestPayloadBase
 
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, false, opts.Alt, baseURL)
 			if errReq != nil {
@@ -581,29 +790,9 @@ attemptLoop:
 			helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 
 			if httpResp.StatusCode == http.StatusTooManyRequests {
-				decision := decideAntigravity429(bodyBytes)
-				switch decision.kind {
-				case antigravity429DecisionInstantRetrySameAuth:
-					if attempt+1 < attempts {
-						if decision.retryAfter != nil && *decision.retryAfter > 0 {
-							wait := antigravityInstantRetryDelay(*decision.retryAfter)
-							log.Debugf("antigravity executor: instant retry for model %s, waiting %s", baseModel, wait)
-							if errWait := antigravityWait(ctx, wait); errWait != nil {
-								return resp, errWait
-							}
-						}
-						continue attemptLoop
-					}
-				case antigravity429DecisionShortCooldownSwitchAuth:
-					if decision.retryAfter != nil && *decision.retryAfter > 0 {
-						markAntigravityShortCooldown(auth, baseModel, time.Now(), *decision.retryAfter)
-						log.Debugf("antigravity executor: short quota cooldown (%s) for model %s, recorded cooldown", *decision.retryAfter, baseModel)
-					}
-				case antigravity429DecisionFullQuotaExhausted:
-					if useCredits && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
-						markAntigravityCreditsPermanentlyDisabled(auth)
-					}
-					// No credits logic - just fall through to error return below
+				if errQuota := handleAntigravityQuota429(authID, family, httpResp.StatusCode, bodyBytes, usedCredit, auth); errQuota != nil {
+					err = errQuota
+					return resp, err
 				}
 			}
 
@@ -653,7 +842,8 @@ attemptLoop:
 			}
 
 			// Success
-			if useCredits {
+			markAntigravityQuotaSuccess(authID, family, usedCredit, isProbe)
+			if usedCredit {
 				clearAntigravityCreditsFailureState(auth)
 			}
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
@@ -722,7 +912,11 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 
-	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+	requestPayloadBase, authID, family, usedCredit, isProbe, errRoute := e.prepareAntigravityQuotaRouting(ctx, auth, baseModel, "claude_nonstream", translated)
+	if errRoute != nil {
+		err = errRoute
+		return resp, err
+	}
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
@@ -736,13 +930,7 @@ attemptLoop:
 		var lastErr error
 
 		for idx, baseURL := range baseURLs {
-			requestPayload := translated
-			if useCredits {
-				if cp := injectEnabledCreditTypes(translated); len(cp) > 0 {
-					requestPayload = cp
-					helps.MarkCreditsUsed(ctx)
-				}
-			}
+			requestPayload := requestPayloadBase
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL)
 			if errReq != nil {
 				err = errReq
@@ -793,30 +981,9 @@ attemptLoop:
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 				if httpResp.StatusCode == http.StatusTooManyRequests {
-					decision := decideAntigravity429(bodyBytes)
-
-					switch decision.kind {
-					case antigravity429DecisionInstantRetrySameAuth:
-						if attempt+1 < attempts {
-							if decision.retryAfter != nil && *decision.retryAfter > 0 {
-								wait := antigravityInstantRetryDelay(*decision.retryAfter)
-								log.Debugf("antigravity executor: instant retry for model %s, waiting %s", baseModel, wait)
-								if errWait := antigravityWait(ctx, wait); errWait != nil {
-									return resp, errWait
-								}
-							}
-							continue attemptLoop
-						}
-					case antigravity429DecisionShortCooldownSwitchAuth:
-						if decision.retryAfter != nil && *decision.retryAfter > 0 {
-							markAntigravityShortCooldown(auth, baseModel, time.Now(), *decision.retryAfter)
-							log.Debugf("antigravity executor: short quota cooldown (%s) for model %s, recorded cooldown", *decision.retryAfter, baseModel)
-						}
-					case antigravity429DecisionFullQuotaExhausted:
-						if useCredits && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
-							markAntigravityCreditsPermanentlyDisabled(auth)
-						}
-						// No credits logic - just fall through to error return below
+					if errQuota := handleAntigravityQuota429(authID, family, httpResp.StatusCode, bodyBytes, usedCredit, auth); errQuota != nil {
+						err = errQuota
+						return resp, err
 					}
 				}
 
@@ -864,7 +1031,8 @@ attemptLoop:
 			}
 
 			// Stream success
-			if useCredits {
+			markAntigravityQuotaSuccess(authID, family, usedCredit, isProbe)
+			if usedCredit {
 				clearAntigravityCreditsFailureState(auth)
 			}
 			out := make(chan cliproxyexecutor.StreamChunk)
@@ -1183,7 +1351,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 
-	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+	requestPayloadBase, authID, family, usedCredit, isProbe, errRoute := e.prepareAntigravityQuotaRouting(ctx, auth, baseModel, "stream", translated)
+	if errRoute != nil {
+		err = errRoute
+		return nil, err
+	}
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
@@ -1197,13 +1369,7 @@ attemptLoop:
 		var lastErr error
 
 		for idx, baseURL := range baseURLs {
-			requestPayload := translated
-			if useCredits {
-				if cp := injectEnabledCreditTypes(translated); len(cp) > 0 {
-					requestPayload = cp
-					helps.MarkCreditsUsed(ctx)
-				}
-			}
+			requestPayload := requestPayloadBase
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL)
 			if errReq != nil {
 				err = errReq
@@ -1253,30 +1419,9 @@ attemptLoop:
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 				if httpResp.StatusCode == http.StatusTooManyRequests {
-					decision := decideAntigravity429(bodyBytes)
-
-					switch decision.kind {
-					case antigravity429DecisionInstantRetrySameAuth:
-						if attempt+1 < attempts {
-							if decision.retryAfter != nil && *decision.retryAfter > 0 {
-								wait := antigravityInstantRetryDelay(*decision.retryAfter)
-								log.Debugf("antigravity executor: instant retry for model %s, waiting %s", baseModel, wait)
-								if errWait := antigravityWait(ctx, wait); errWait != nil {
-									return nil, errWait
-								}
-							}
-							continue attemptLoop
-						}
-					case antigravity429DecisionShortCooldownSwitchAuth:
-						if decision.retryAfter != nil && *decision.retryAfter > 0 {
-							markAntigravityShortCooldown(auth, baseModel, time.Now(), *decision.retryAfter)
-							log.Debugf("antigravity executor: short quota cooldown (%s) for model %s recorded", *decision.retryAfter, baseModel)
-						}
-					case antigravity429DecisionFullQuotaExhausted:
-						if useCredits && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
-							markAntigravityCreditsPermanentlyDisabled(auth)
-						}
-						// No credits logic - just fall through to error return below
+					if errQuota := handleAntigravityQuota429(authID, family, httpResp.StatusCode, bodyBytes, usedCredit, auth); errQuota != nil {
+						err = errQuota
+						return nil, err
 					}
 				}
 
@@ -1324,7 +1469,8 @@ attemptLoop:
 			}
 
 			// Stream success
-			if useCredits {
+			markAntigravityQuotaSuccess(authID, family, usedCredit, isProbe)
+			if usedCredit {
 				clearAntigravityCreditsFailureState(auth)
 			}
 			out := make(chan cliproxyexecutor.StreamChunk)
@@ -1658,7 +1804,9 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 		return
 	}
 	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known {
-		return
+		if !hint.UpdatedAt.IsZero() && time.Since(hint.UpdatedAt) < antigravityCreditsHintRefreshInterval {
+			return
+		}
 	}
 	if strings.TrimSpace(accessToken) == "" {
 		accessToken = metaStringValue(auth.Metadata, "access_token")
@@ -1901,10 +2049,25 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 	}
 
 	authID := strings.TrimSpace(auth.ID)
-	paidTierID := strings.TrimSpace(gjson.GetBytes(bodyBytes, "paidTier.id").String())
+	payload := gjson.ParseBytes(bodyBytes)
+	paidTierID := firstGJSONPathString(payload,
+		"paidTier.id",
+		"paid_tier.id",
+		"currentTier.id",
+		"current_tier.id",
+	)
 
-	credits := gjson.GetBytes(bodyBytes, "paidTier.availableCredits")
-	if !credits.IsArray() {
+	credits, hasCredits := firstGJSONPathArray(payload,
+		"paidTier.availableCredits",
+		"paidTier.available_credits",
+		"paid_tier.availableCredits",
+		"paid_tier.available_credits",
+		"currentTier.availableCredits",
+		"currentTier.available_credits",
+		"current_tier.availableCredits",
+		"current_tier.available_credits",
+	)
+	if !hasCredits {
 		cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{
 			Known:      true,
 			Available:  false,
@@ -1914,16 +2077,17 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 		return
 	}
 	for _, credit := range credits.Array() {
-		if !strings.EqualFold(credit.Get("creditType").String(), "GOOGLE_ONE_AI") {
+		creditType := firstGJSONPathString(credit, "creditType", "credit_type", "type")
+		if !strings.EqualFold(creditType, "GOOGLE_ONE_AI") {
 			continue
 		}
-		creditAmount, errCA := strconv.ParseFloat(strings.TrimSpace(credit.Get("creditAmount").String()), 64)
-		if errCA != nil {
+		creditAmount, okCreditAmount := firstGJSONPathFloat(credit, "creditAmount", "credit_amount", "amount", "availableAmount", "available_amount")
+		if !okCreditAmount {
 			continue
 		}
-		minAmount, errMA := strconv.ParseFloat(strings.TrimSpace(credit.Get("minimumCreditAmountForUsage").String()), 64)
-		if errMA != nil {
-			continue
+		minAmount, okMinAmount := firstGJSONPathFloat(credit, "minimumCreditAmountForUsage", "minimum_credit_amount_for_usage", "minCreditAmount", "min_credit_amount")
+		if !okMinAmount {
+			minAmount = 1
 		}
 		bal := antigravityCreditsBalance{
 			CreditAmount:    creditAmount,
@@ -1945,6 +2109,49 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 		}
 		return
 	}
+	cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{
+		Known:      true,
+		Available:  false,
+		PaidTierID: paidTierID,
+		UpdatedAt:  time.Now(),
+	})
+}
+
+func firstGJSONPathString(source gjson.Result, paths ...string) string {
+	for _, path := range paths {
+		if value := source.Get(path); value.Exists() {
+			if text := strings.TrimSpace(value.String()); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func firstGJSONPathArray(source gjson.Result, paths ...string) (gjson.Result, bool) {
+	for _, path := range paths {
+		value := source.Get(path)
+		if value.Exists() && value.IsArray() {
+			return value, true
+		}
+	}
+	return gjson.Result{}, false
+}
+
+func firstGJSONPathFloat(source gjson.Result, paths ...string) (float64, bool) {
+	for _, path := range paths {
+		value := source.Get(path)
+		if !value.Exists() {
+			continue
+		}
+		if value.Type == gjson.Number {
+			return value.Float(), true
+		}
+		if parsed, errParse := strconv.ParseFloat(strings.TrimSpace(value.String()), 64); errParse == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string) (*http.Request, error) {
@@ -2367,8 +2574,8 @@ var antigravityBaseURLFallbackOrder = func(auth *cliproxyauth.Auth) []string {
 		return []string{base}
 	}
 	return []string{
-		antigravityBaseURLDaily,
 		antigravityBaseURLProd,
+		antigravityBaseURLDaily,
 		// antigravitySandboxBaseURLDaily,
 	}
 }

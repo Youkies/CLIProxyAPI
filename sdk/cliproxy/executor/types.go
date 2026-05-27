@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/url"
+	"time"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -94,4 +97,69 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+type freeQuotaOnlyKey struct{}
+
+// WithFreeQuotaOnly returns a context signalling that the executor should only
+// attempt the free quota channel for the current request.
+func WithFreeQuotaOnly(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, freeQuotaOnlyKey{}, true)
+}
+
+// IsFreeQuotaOnly reports whether the context is in free-quota-only mode.
+func IsFreeQuotaOnly(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(freeQuotaOnlyKey{}).(bool)
+	return v
+}
+
+// FreeQuotaDeferralError is returned by executors when an auth's free quota
+// should be deferred to a later credit phase rather than marked as failed.
+type FreeQuotaDeferralError interface {
+	error
+	IsFreeQuotaDeferral() bool
+}
+
+// FreeQuotaDeferralInfo carries the cooldown window observed from an upstream
+// quota error so callers can persist or seed runtime cooldown state.
+type FreeQuotaDeferralInfo interface {
+	FreeQuotaDeferralError
+	FreeQuotaAuthID() string
+	FreeQuotaFamily() string
+	FreeQuotaCooldownUntil() time.Time
+	FreeQuotaMessage() string
+}
+
+// IsFreeQuotaDeferralErr reports whether err is a FreeQuotaDeferralError.
+func IsFreeQuotaDeferralErr(err error) bool {
+	var d FreeQuotaDeferralError
+	return errors.As(err, &d) && d != nil && d.IsFreeQuotaDeferral()
+}
+
+// GetFreeQuotaDeferralInfo extracts optional cooldown details from err.
+func GetFreeQuotaDeferralInfo(err error) (FreeQuotaDeferralInfo, bool) {
+	var d FreeQuotaDeferralInfo
+	if errors.As(err, &d) && d != nil && d.IsFreeQuotaDeferral() {
+		return d, true
+	}
+	return nil, false
+}
+
+// RateLimitSwitchError is returned by executors when a transient per-credential
+// QPM limit is hit and the conductor should try another credential.
+type RateLimitSwitchError interface {
+	error
+	IsRateLimitSwitch() bool
+}
+
+// IsRateLimitSwitchErr reports whether err is a RateLimitSwitchError.
+func IsRateLimitSwitchErr(err error) bool {
+	var r RateLimitSwitchError
+	return errors.As(err, &r) && r != nil && r.IsRateLimitSwitch()
 }

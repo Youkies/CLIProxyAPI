@@ -413,6 +413,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
 	}
+	addAntigravityCreditsEntry(entry, auth)
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
 			entry["account_type"] = accountType
@@ -519,6 +520,37 @@ func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func addAntigravityCreditsEntry(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || auth == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		return
+	}
+	hint, ok := coreauth.GetAntigravityCreditsHint(auth.ID)
+	if !ok || !hint.Known {
+		return
+	}
+	credits := gin.H{
+		"known":                           true,
+		"available":                       hint.Available,
+		"credit_amount":                   hint.CreditAmount,
+		"creditAmount":                    hint.CreditAmount,
+		"min_credit_amount":               hint.MinCreditAmount,
+		"minimumCreditAmountForUsage":     hint.MinCreditAmount,
+		"minimum_credit_amount_for_usage": hint.MinCreditAmount,
+		"paid_tier_id":                    hint.PaidTierID,
+		"paidTierID":                      hint.PaidTierID,
+		"tier_id":                         hint.PaidTierID,
+	}
+	if !hint.UpdatedAt.IsZero() {
+		credits["updated_at"] = hint.UpdatedAt
+		credits["updatedAt"] = hint.UpdatedAt
+	}
+	entry["ai_credits"] = credits
+	entry["antigravity_credits"] = credits
 }
 
 func authProjectID(auth *coreauth.Auth) string {

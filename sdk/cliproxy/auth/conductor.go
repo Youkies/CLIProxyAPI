@@ -99,6 +99,331 @@ func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	return quotaCooldownDisabled.Load()
 }
 
+func hintedCooldownForRequest(hint cliproxyexecutor.FreeQuotaCooldownHintMap, model string) map[string]struct{} {
+	if len(hint) == 0 {
+		return nil
+	}
+	family := cliproxyexecutor.ModelQuotaFamilyHint(model)
+	ids := hint[family]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(ids))
+	now := time.Now()
+	for authID, until := range ids {
+		if until.IsZero() || until.After(now) {
+			out[authID] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mergeFreeQuotaCooldownHints(base, extra cliproxyexecutor.FreeQuotaCooldownHintMap) cliproxyexecutor.FreeQuotaCooldownHintMap {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	merged := make(cliproxyexecutor.FreeQuotaCooldownHintMap, len(base)+len(extra))
+	for family, ids := range base {
+		if len(ids) == 0 {
+			continue
+		}
+		dst := merged[family]
+		if dst == nil {
+			dst = make(map[string]time.Time, len(ids))
+			merged[family] = dst
+		}
+		for id, until := range ids {
+			dst[id] = until
+		}
+	}
+	for family, ids := range extra {
+		if len(ids) == 0 {
+			continue
+		}
+		dst := merged[family]
+		if dst == nil {
+			dst = make(map[string]time.Time, len(ids))
+			merged[family] = dst
+		}
+		for id, until := range ids {
+			if current, ok := dst[id]; !ok || until.After(current) {
+				dst[id] = until
+			}
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func addFreeQuotaCooldownHint(hint cliproxyexecutor.FreeQuotaCooldownHintMap, family, authID string, until time.Time) cliproxyexecutor.FreeQuotaCooldownHintMap {
+	family = strings.TrimSpace(family)
+	authID = strings.TrimSpace(authID)
+	if family == "" || authID == "" || until.IsZero() || !until.After(time.Now()) {
+		return hint
+	}
+	if hint == nil {
+		hint = cliproxyexecutor.FreeQuotaCooldownHintMap{}
+	}
+	sub := hint[family]
+	if sub == nil {
+		sub = make(map[string]time.Time)
+		hint[family] = sub
+	}
+	if current, ok := sub[authID]; !ok || until.After(current) {
+		sub[authID] = until
+	}
+	return hint
+}
+
+func addFreeQuotaDeferralHint(hint cliproxyexecutor.FreeQuotaCooldownHintMap, err error, authID, model string) cliproxyexecutor.FreeQuotaCooldownHintMap {
+	info, ok := cliproxyexecutor.GetFreeQuotaDeferralInfo(err)
+	if !ok {
+		return hint
+	}
+	if v := strings.TrimSpace(info.FreeQuotaAuthID()); v != "" {
+		authID = v
+	}
+	family := strings.TrimSpace(info.FreeQuotaFamily())
+	if family == "" {
+		family = cliproxyexecutor.ModelQuotaFamilyHint(model)
+	}
+	return addFreeQuotaCooldownHint(hint, family, authID, info.FreeQuotaCooldownUntil())
+}
+
+func freeQuotaCooldownHintActive(ctx context.Context, authID, model string, now time.Time) bool {
+	hint := cliproxyexecutor.FreeQuotaCooldownHint(ctx)
+	if len(hint) == 0 {
+		return false
+	}
+	family := cliproxyexecutor.ModelQuotaFamilyHint(model)
+	sub := hint[family]
+	if len(sub) == 0 {
+		return false
+	}
+	until, ok := sub[authID]
+	if !ok {
+		return false
+	}
+	return until.IsZero() || until.After(now)
+}
+
+func modelMatchesQuotaFamily(model, family string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	return cliproxyexecutor.ModelQuotaFamilyHint(model) == family
+}
+
+func quotaErrorTextMatchesFamily(text, family string) bool {
+	text = strings.ToLower(text)
+	if text == "" {
+		return false
+	}
+	if !strings.Contains(text, "quota_exhausted") && !strings.Contains(text, "individual quota reached") {
+		return false
+	}
+	switch family {
+	case cliproxyexecutor.FamilyQuotaClaude:
+		return strings.Contains(text, "claude")
+	case cliproxyexecutor.FamilyQuotaGemini:
+		return strings.Contains(text, "gemini")
+	default:
+		return false
+	}
+}
+
+func extractFirstJSONObject(text string) string {
+	start := strings.Index(text, "{")
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(text); i++ {
+		c := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return text[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+func parseAntigravityQuotaCooldownTime(text, family string, now time.Time) (time.Time, bool) {
+	raw := extractFirstJSONObject(text)
+	if raw == "" {
+		return time.Time{}, false
+	}
+
+	var payload struct {
+		Error struct {
+			Message string            `json:"message"`
+			Status  string            `json:"status"`
+			Details []json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return time.Time{}, false
+	}
+
+	quotaSignal := strings.EqualFold(payload.Error.Status, "RESOURCE_EXHAUSTED") &&
+		strings.Contains(strings.ToLower(payload.Error.Message), "individual quota")
+	familySignal := quotaErrorTextMatchesFamily(raw, family)
+	var (
+		resetAt       time.Time
+		hasResetAt    bool
+		retryDelay    time.Duration
+		hasRetryDelay bool
+	)
+
+	for _, detailRaw := range payload.Error.Details {
+		var detail struct {
+			Type       string            `json:"@type"`
+			Reason     string            `json:"reason"`
+			Metadata   map[string]string `json:"metadata"`
+			RetryDelay string            `json:"retryDelay"`
+		}
+		if err := json.Unmarshal(detailRaw, &detail); err != nil {
+			continue
+		}
+		if strings.EqualFold(detail.Reason, "QUOTA_EXHAUSTED") {
+			quotaSignal = true
+		}
+		if modelMatchesQuotaFamily(detail.Metadata["model"], family) {
+			familySignal = true
+		}
+		if resetRaw := strings.TrimSpace(detail.Metadata["quotaResetTimestamp"]); resetRaw != "" {
+			if ts, err := time.Parse(time.RFC3339Nano, resetRaw); err == nil {
+				resetAt = ts
+				hasResetAt = true
+			}
+		}
+		if delayRaw := strings.TrimSpace(detail.Metadata["quotaResetDelay"]); delayRaw != "" {
+			if d, err := time.ParseDuration(delayRaw); err == nil && d > 0 {
+				retryDelay = d
+				hasRetryDelay = true
+			}
+		}
+		if delayRaw := strings.TrimSpace(detail.RetryDelay); delayRaw != "" {
+			if d, err := time.ParseDuration(delayRaw); err == nil && d > 0 {
+				retryDelay = d
+				hasRetryDelay = true
+			}
+		}
+	}
+
+	if !quotaSignal || !familySignal {
+		return time.Time{}, false
+	}
+	if hasResetAt {
+		return resetAt, resetAt.After(now)
+	}
+	if hasRetryDelay {
+		return now.Add(retryDelay), true
+	}
+	return time.Time{}, false
+}
+
+func antigravityAuthFreeQuotaExhaustedForFamily(auth *Auth, family string, now time.Time) bool {
+	_, ok := antigravityAuthFreeQuotaCooldownUntil(auth, family, now)
+	return ok
+}
+
+func antigravityAuthFreeQuotaCooldownUntil(auth *Auth, family string, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(auth.Provider, "antigravity") {
+		return time.Time{}, false
+	}
+	var latest time.Time
+	for model, state := range auth.ModelStates {
+		if state == nil || !modelMatchesQuotaFamily(model, family) {
+			continue
+		}
+		stateText := state.StatusMessage
+		if state.LastError != nil {
+			stateText += " " + state.LastError.Message
+		}
+		if until, ok := parseAntigravityQuotaCooldownTime(stateText, family, now); ok {
+			if until.After(now) && until.After(latest) {
+				latest = until
+			}
+		}
+	}
+	if until, ok := parseAntigravityQuotaCooldownTime(auth.StatusMessage, family, now); ok {
+		if until.After(now) && until.After(latest) {
+			latest = until
+		}
+	}
+	if auth.LastError != nil {
+		if until, ok := parseAntigravityQuotaCooldownTime(auth.LastError.Message, family, now); ok {
+			if until.After(now) && until.After(latest) {
+				latest = until
+			}
+		}
+	}
+	if latest.IsZero() {
+		return time.Time{}, false
+	}
+	return latest, true
+}
+
+func (m *Manager) antigravityFreeQuotaCooldownHint(providers []string, model string) cliproxyexecutor.FreeQuotaCooldownHintMap {
+	if !hasAntigravityProvider(providers) {
+		return nil
+	}
+	family := cliproxyexecutor.ModelQuotaFamilyHint(model)
+	now := time.Now()
+	hint := cliproxyexecutor.FreeQuotaCooldownHintMap{}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || !strings.EqualFold(auth.Provider, "antigravity") {
+			continue
+		}
+		until, ok := antigravityAuthFreeQuotaCooldownUntil(auth, family, now)
+		if !ok {
+			continue
+		}
+		sub := hint[family]
+		if sub == nil {
+			sub = make(map[string]time.Time)
+			hint[family] = sub
+		}
+		sub[auth.ID] = until
+	}
+	if len(hint) == 0 {
+		return nil
+	}
+	return hint
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.
@@ -179,6 +504,10 @@ type Manager struct {
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
 
+	// antigravityCreditOffsets tracks credits-phase rotation for auths whose
+	// free quota is cooling down but AI credits are still available.
+	antigravityCreditOffsets map[string]int
+
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
@@ -202,14 +531,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:                    store,
+		executors:                make(map[string]ProviderExecutor),
+		selector:                 selector,
+		hook:                     hook,
+		auths:                    make(map[string]*Auth),
+		homeRuntimeAuths:         make(map[string]map[string]*Auth),
+		providerOffsets:          make(map[string]int),
+		modelPoolOffsets:         make(map[string]int),
+		antigravityCreditOffsets: make(map[string]int),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -879,6 +1209,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
+			if cliproxyexecutor.IsFreeQuotaDeferralErr(errStream) || cliproxyexecutor.IsRateLimitSwitchErr(errStream) {
+				return nil, errStream
+			}
 			rerr := &Error{Message: errStream.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
@@ -898,6 +1231,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
+			}
+			if cliproxyexecutor.IsFreeQuotaDeferralErr(bootstrapErr) || cliproxyexecutor.IsRateLimitSwitchErr(bootstrapErr) {
+				discardStreamChunks(streamResult.Chunks)
+				return nil, bootstrapErr
 			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
@@ -1252,7 +1589,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 				return resp, nil
 			}
 		}
-		return cliproxyexecutor.Response{}, lastErr
+		return cliproxyexecutor.Response{}, publicExecutionError(lastErr)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -1322,7 +1659,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
 			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 		}
-		return nil, lastErr
+		return nil, publicExecutionError(lastErr)
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -1337,11 +1674,22 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	freeQuotaExhausted := make(map[string]struct{})
+	quotaCooldownHint := mergeFreeQuotaCooldownHints(
+		cliproxyexecutor.FreeQuotaCooldownHint(ctx),
+		m.antigravityFreeQuotaCooldownHint(providers, routeModel),
+	)
+	if len(quotaCooldownHint) > 0 {
+		ctx = cliproxyexecutor.WithFreeQuotaCooldownHint(ctx, quotaCooldownHint)
+	}
+	hintedCooldown := hintedCooldownForRequest(quotaCooldownHint, routeModel)
+	noCreditHint := cliproxyexecutor.NoCreditCooldownHint(ctx)
+	inCreditPhase := false
 	var lastErr error
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
-				return cliproxyexecutor.Response{}, lastErr
+				return cliproxyexecutor.Response{}, publicExecutionError(lastErr)
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
@@ -1349,8 +1697,34 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		pickExclude := tried
+		if hasAntigravityProvider(providers) {
+			if !inCreditPhase {
+				pickExclude = unionMaps(tried, freeQuotaExhausted)
+				if len(hintedCooldown) > 0 {
+					pickExclude = unionMaps(pickExclude, hintedCooldown)
+				}
+			} else if len(noCreditHint) > 0 {
+				pickExclude = unionMaps(pickExclude, noCreditHint)
+			}
+		}
+		var (
+			auth     *Auth
+			executor ProviderExecutor
+			provider string
+			errPick  error
+		)
+		if hasAntigravityProvider(providers) && inCreditPhase {
+			auth, executor, provider, _ = m.pickAntigravityCreditPhaseCandidate(ctx, routeModel, pickOpts, unionMaps(tried, noCreditHint), unionMaps(freeQuotaExhausted, hintedCooldown))
+		}
+		if auth == nil {
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, pickExclude)
+		}
 		if errPick != nil {
+			if hasAntigravityProvider(providers) && !inCreditPhase && (len(freeQuotaExhausted) > 0 || len(hintedCooldown) > 0) {
+				inCreditPhase = true
+				continue
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1368,6 +1742,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		if strings.EqualFold(provider, "antigravity") && !inCreditPhase {
+			execCtx = cliproxyexecutor.WithFreeQuotaOnly(execCtx)
+		}
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1391,6 +1768,25 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			if cliproxyexecutor.IsFreeQuotaDeferralErr(errExec) {
+				m.recordFreeQuotaDeferral(execCtx, auth.ID, resultModel, errExec)
+				quotaCooldownHint = addFreeQuotaDeferralHint(quotaCooldownHint, errExec, auth.ID, resultModel)
+				if len(quotaCooldownHint) > 0 {
+					ctx = cliproxyexecutor.WithFreeQuotaCooldownHint(ctx, quotaCooldownHint)
+				}
+				hintedCooldown = hintedCooldownForRequest(quotaCooldownHint, routeModel)
+				delete(tried, auth.ID)
+				delete(attempted, auth.ID)
+				freeQuotaExhausted[auth.ID] = struct{}{}
+				authErr = nil
+				break
+			}
+			if cliproxyexecutor.IsRateLimitSwitchErr(errExec) {
+				delete(attempted, auth.ID)
+				lastErr = errExec
+				authErr = nil
+				break
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -1440,7 +1836,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
-				return cliproxyexecutor.Response{}, lastErr
+				return cliproxyexecutor.Response{}, publicExecutionError(lastErr)
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
@@ -1535,11 +1931,22 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	freeQuotaExhausted := make(map[string]struct{})
+	quotaCooldownHint := mergeFreeQuotaCooldownHints(
+		cliproxyexecutor.FreeQuotaCooldownHint(ctx),
+		m.antigravityFreeQuotaCooldownHint(providers, routeModel),
+	)
+	if len(quotaCooldownHint) > 0 {
+		ctx = cliproxyexecutor.WithFreeQuotaCooldownHint(ctx, quotaCooldownHint)
+	}
+	hintedCooldown := hintedCooldownForRequest(quotaCooldownHint, routeModel)
+	noCreditHint := cliproxyexecutor.NoCreditCooldownHint(ctx)
+	inCreditPhase := false
 	var lastErr error
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
-				return nil, lastErr
+				return nil, publicExecutionError(lastErr)
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
@@ -1547,8 +1954,34 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		pickExclude := tried
+		if hasAntigravityProvider(providers) {
+			if !inCreditPhase {
+				pickExclude = unionMaps(tried, freeQuotaExhausted)
+				if len(hintedCooldown) > 0 {
+					pickExclude = unionMaps(pickExclude, hintedCooldown)
+				}
+			} else if len(noCreditHint) > 0 {
+				pickExclude = unionMaps(pickExclude, noCreditHint)
+			}
+		}
+		var (
+			auth     *Auth
+			executor ProviderExecutor
+			provider string
+			errPick  error
+		)
+		if hasAntigravityProvider(providers) && inCreditPhase {
+			auth, executor, provider, _ = m.pickAntigravityCreditPhaseCandidate(ctx, routeModel, pickOpts, unionMaps(tried, noCreditHint), unionMaps(freeQuotaExhausted, hintedCooldown))
+		}
+		if auth == nil {
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, pickExclude)
+		}
 		if errPick != nil {
+			if hasAntigravityProvider(providers) && !inCreditPhase && (len(freeQuotaExhausted) > 0 || len(hintedCooldown) > 0) {
+				inCreditPhase = true
+				continue
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}
@@ -1564,6 +1997,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
+		}
+		if strings.EqualFold(provider, "antigravity") && !inCreditPhase {
+			execCtx = cliproxyexecutor.WithFreeQuotaOnly(execCtx)
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1583,6 +2019,23 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
 		if errStream != nil {
+			if cliproxyexecutor.IsFreeQuotaDeferralErr(errStream) {
+				m.recordFreeQuotaDeferral(execCtx, auth.ID, routeModel, errStream)
+				quotaCooldownHint = addFreeQuotaDeferralHint(quotaCooldownHint, errStream, auth.ID, routeModel)
+				if len(quotaCooldownHint) > 0 {
+					ctx = cliproxyexecutor.WithFreeQuotaCooldownHint(ctx, quotaCooldownHint)
+				}
+				hintedCooldown = hintedCooldownForRequest(quotaCooldownHint, routeModel)
+				delete(tried, auth.ID)
+				delete(attempted, auth.ID)
+				freeQuotaExhausted[auth.ID] = struct{}{}
+				continue
+			}
+			if cliproxyexecutor.IsRateLimitSwitchErr(errStream) {
+				delete(attempted, auth.ID)
+				lastErr = errStream
+				continue
+			}
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -2279,17 +2732,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		if result.Success {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
+				if !freeQuotaCooldownHintActive(ctx, result.AuthID, result.Model, now) {
+					state := ensureModelState(auth, result.Model)
+					resetModelState(state, now)
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					shouldResumeModel = true
+					clearModelQuota = true
 				}
 				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -2426,6 +2881,92 @@ func ensureModelState(auth *Auth, model string) *ModelState {
 	state := &ModelState{Status: StatusActive}
 	auth.ModelStates[model] = state
 	return state
+}
+
+func (m *Manager) recordFreeQuotaDeferral(ctx context.Context, authID, model string, err error) {
+	if authID == "" || model == "" || err == nil {
+		return
+	}
+	info, ok := cliproxyexecutor.GetFreeQuotaDeferralInfo(err)
+	if !ok {
+		return
+	}
+	until := info.FreeQuotaCooldownUntil()
+	if until.IsZero() || !until.After(time.Now()) {
+		return
+	}
+	message := strings.TrimSpace(info.FreeQuotaMessage())
+	if message == "" {
+		message = err.Error()
+	}
+
+	var snapshot *Auth
+	m.mu.Lock()
+	if auth, okAuth := m.auths[authID]; okAuth && auth != nil {
+		now := time.Now()
+		state := ensureModelState(auth, model)
+		state.Status = StatusError
+		state.StatusMessage = message
+		state.Unavailable = true
+		state.NextRetryAfter = until
+		state.LastError = &Error{
+			Code:       "free_quota_exhausted",
+			Message:    message,
+			HTTPStatus: http.StatusTooManyRequests,
+		}
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: until,
+		}
+		state.UpdatedAt = now
+		auth.LastError = cloneError(state.LastError)
+		auth.StatusMessage = message
+		auth.Status = StatusError
+		auth.UpdatedAt = now
+		updateAggregatedAvailability(auth, now)
+		_ = m.persist(ctx, auth)
+		snapshot = auth.Clone()
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+}
+
+func (m *Manager) resetAuthsQuotaCooldownForRetry(authIDs map[string]struct{}) {
+	if len(authIDs) == 0 {
+		return
+	}
+	var snapshots []*Auth
+	m.mu.Lock()
+	now := time.Now()
+	for authID := range authIDs {
+		auth, ok := m.auths[authID]
+		if !ok || auth == nil || len(auth.ModelStates) == 0 {
+			continue
+		}
+		reset := false
+		for _, state := range auth.ModelStates {
+			if state != nil && state.Quota.Exceeded {
+				resetModelState(state, now)
+				reset = true
+			}
+		}
+		if reset {
+			updateAggregatedAvailability(auth, now)
+			auth.UpdatedAt = now
+			snapshots = append(snapshots, auth.Clone())
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil {
+		for _, snapshot := range snapshots {
+			m.scheduler.upsertAuth(snapshot)
+		}
+	}
 }
 
 func resetModelState(state *ModelState, now time.Time) {
@@ -2833,6 +3374,21 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+// unionMaps returns a new map containing all keys from both maps.
+func unionMaps(a, b map[string]struct{}) map[string]struct{} {
+	if len(b) == 0 {
+		return a
+	}
+	out := make(map[string]struct{}, len(a)+len(b))
+	for k := range a {
+		out[k] = struct{}{}
+	}
+	for k := range b {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
@@ -3298,6 +3854,124 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 }
 
+func (m *Manager) pickAntigravityCreditPhaseCandidate(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, exclude, allowed map[string]struct{}) (*Auth, ProviderExecutor, string, bool) {
+	if m == nil || len(allowed) == 0 {
+		return nil, nil, "", false
+	}
+	executor, okExecutor := m.Executor("antigravity")
+	if !okExecutor || executor == nil {
+		return nil, nil, "", false
+	}
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	registryRef := registry.GetGlobalRegistry()
+	now := time.Now()
+
+	candidates := make([]*Auth, 0, len(allowed))
+	m.mu.RLock()
+	for authID := range allowed {
+		if pinnedAuthID != "" && authID != pinnedAuthID {
+			continue
+		}
+		if _, skip := exclude[authID]; skip {
+			continue
+		}
+		auth := m.auths[authID]
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		if !antigravityCreditsAvailableForModel(auth, routeModel) {
+			continue
+		}
+		if strings.TrimSpace(routeModel) != "" && !m.authSupportsRouteModel(registryRef, auth, routeModel) {
+			continue
+		}
+		if until, ok := antigravityAuthFreeQuotaCooldownUntil(auth, cliproxyexecutor.ModelQuotaFamilyHint(routeModel), now); ok && until.After(now) {
+			candidates = append(candidates, auth.Clone())
+			continue
+		}
+		if freeQuotaCooldownHintActive(ctx, authID, routeModel, now) {
+			candidates = append(candidates, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+
+	authCopy := m.pickAntigravityCreditPhaseAuth(routeModel, candidates)
+	if authCopy == nil {
+		return nil, nil, "", false
+	}
+	if !authCopy.indexAssigned {
+		m.mu.Lock()
+		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			current.EnsureIndex()
+			authCopy = current.Clone()
+		}
+		m.mu.Unlock()
+	}
+	return authCopy, executor, "antigravity", true
+}
+
+func (m *Manager) pickAntigravityCreditPhaseAuth(routeModel string, candidates []*Auth) *Auth {
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		pi := authPriority(candidates[i])
+		pj := authPriority(candidates[j])
+		if pi != pj {
+			return pi > pj
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+
+	if _, ok := m.selector.(*FillFirstSelector); ok {
+		return candidates[0].Clone()
+	}
+
+	bestPriority := authPriority(candidates[0])
+	limit := 1
+	for limit < len(candidates) {
+		if authPriority(candidates[limit]) != bestPriority {
+			break
+		}
+		limit++
+	}
+	offset := m.nextAntigravityCreditOffset(routeModel, limit)
+	return candidates[offset%limit].Clone()
+}
+
+func antigravityCreditPhaseCursorKey(routeModel string) string {
+	family := strings.TrimSpace(cliproxyexecutor.ModelQuotaFamilyHint(routeModel))
+	if family != "" {
+		return "antigravity:credits:" + family
+	}
+	modelKey := canonicalModelKey(routeModel)
+	if modelKey == "" {
+		modelKey = "*"
+	}
+	return "antigravity:credits:" + modelKey
+}
+
+func (m *Manager) nextAntigravityCreditOffset(routeModel string, size int) int {
+	if m == nil || size <= 1 {
+		return 0
+	}
+	key := antigravityCreditPhaseCursorKey(routeModel)
+	m.mu.Lock()
+	if m.antigravityCreditOffsets == nil {
+		m.antigravityCreditOffsets = make(map[string]int)
+	}
+	index := m.antigravityCreditOffsets[key]
+	if index < 0 || index >= 2_147_483_640 {
+		index = 0
+	}
+	m.antigravityCreditOffsets[key] = index + 1
+	m.mu.Unlock()
+	return index % size
+}
+
 type homeErrorEnvelope struct {
 	Error *homeErrorDetail `json:"error"`
 }
@@ -3325,10 +3999,24 @@ func shouldReturnLastErrorOnPickFailure(homeMode bool, lastErr error, errPick er
 	if lastErr == nil {
 		return false
 	}
+	if cliproxyexecutor.IsRateLimitSwitchErr(lastErr) {
+		return false
+	}
 	if !homeMode {
 		return true
 	}
 	return isHomeRequestRetryExceededError(errPick)
+}
+
+func publicExecutionError(err error) error {
+	if cliproxyexecutor.IsRateLimitSwitchErr(err) {
+		return &Error{
+			Code:       "auth_unavailable",
+			Message:    "all candidate credentials are temporarily rate limited",
+			HTTPStatus: http.StatusServiceUnavailable,
+		}
+	}
+	return err
 }
 
 type homeAuthDispatchResponse struct {
@@ -3683,6 +4371,8 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 				auth:     auth.Clone(),
 				executor: executor,
 				provider: providerKey,
+				known:    true,
+				priority: authPriority(auth),
 			})
 			continue
 		}
@@ -3690,12 +4380,19 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 			auth:     auth.Clone(),
 			executor: executor,
 			provider: providerKey,
+			priority: authPriority(auth),
 		})
 	}
 	sort.Slice(known, func(i, j int) bool {
+		if known[i].priority != known[j].priority {
+			return known[i].priority > known[j].priority
+		}
 		return known[i].auth.ID < known[j].auth.ID
 	})
 	sort.Slice(unknown, func(i, j int) bool {
+		if unknown[i].priority != unknown[j].priority {
+			return unknown[i].priority > unknown[j].priority
+		}
 		return unknown[i].auth.ID < unknown[j].auth.ID
 	})
 	return append(known, unknown...)
@@ -3705,6 +4402,38 @@ type creditsCandidateEntry struct {
 	auth     *Auth
 	executor ProviderExecutor
 	provider string
+	known    bool
+	priority int
+}
+
+func (m *Manager) rotateAntigravityCreditsCandidates(routeModel string, candidates []creditsCandidateEntry) []creditsCandidateEntry {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	if _, ok := m.selector.(*FillFirstSelector); ok {
+		return candidates
+	}
+	firstKnown := candidates[0].known
+	firstPriority := candidates[0].priority
+	limit := 1
+	for limit < len(candidates) {
+		if candidates[limit].known != firstKnown || candidates[limit].priority != firstPriority {
+			break
+		}
+		limit++
+	}
+	if limit <= 1 {
+		return candidates
+	}
+	offset := m.nextAntigravityCreditOffset(routeModel, limit)
+	if offset == 0 {
+		return candidates
+	}
+	rotated := make([]creditsCandidateEntry, 0, len(candidates))
+	rotated = append(rotated, candidates[offset:limit]...)
+	rotated = append(rotated, candidates[:offset]...)
+	rotated = append(rotated, candidates[limit:]...)
+	return rotated
 }
 
 func hasAntigravityProvider(providers []string) bool {
@@ -3730,6 +4459,9 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	if cfg == nil || !cfg.QuotaExceeded.AntigravityCredits {
 		return false
 	}
+	if cliproxyexecutor.IsRateLimitSwitchErr(lastErr) {
+		return true
+	}
 	switch status {
 	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
 		return true
@@ -3751,6 +4483,7 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates = m.rotateAntigravityCreditsCandidates(routeModel, candidates)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return cliproxyexecutor.Response{}, false
@@ -3799,6 +4532,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates = m.rotateAntigravityCreditsCandidates(routeModel, candidates)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return nil, false
